@@ -1,195 +1,305 @@
-# ArduCopter STABILIZE Flight — RC Override Navigation (Cascaded Velocity Control)
+# ArduCopter STABILIZE Flight — RC Override Navigation
 
-Autonomous A->B flight in **STABILIZE mode** using **RC Override**.
-No assisted flight modes — altitude, heading and position are controlled entirely through raw RC channel overrides.
+Autonomous point-to-point flight in **pure STABILIZE mode** using only **RC Override** commands.
+No GPS-assisted modes, no autopilot — altitude, heading, and position are controlled entirely through raw RC channel overrides via a cascaded velocity controller.
+
+## Mission Parameters
 
 | Parameter | Value |
 |-----------|-------|
-| Point A (start) | `50.450739, 30.461242` |
+| Point A (start) | `50.450739, 30.461242` (Kyiv, Ukraine) |
 | Point B (target) | `50.443326, 30.448078` |
+| Route distance | **~967 m** |
 | Cruise altitude | **200 m** |
-| Flight mode | **STABILIZE** throughout |
-| Constant Yaw | **~228.5 deg** (bearing A->B, fixed for the entire flight) |
-| Wind (SITL) | SPD=3, DIR=30 deg, TURB=2, TURB\_FREQ=0.2 |
-
-## Results (5 test runs)
-
-| Run | Distance from B | Flight time |
-|-----|----------------|-------------|
-| 1 | 0.05 m | 182 s |
-| 2 | 0.12 m | 184 s |
-| 3 | 0.11 m | 184 s |
-| 4 | 0.01 m | 182 s |
-| 5 | 0.04 m | 182 s |
-| **Average** | **0.07 m** | **182.8 s** |
+| Flight mode | **STABILIZE** (entire flight) |
+| Constant yaw | **~228.5 deg** (bearing A->B) |
+| Wind (SITL) | SPD=3 m/s, DIR=30 deg, TURB=2, TURB_FREQ=0.2 |
 
 ---
 
-## How it works
+## Test Results (5 runs)
 
-### Architecture
+| Run | Distance from B | Flight time | Yaw | Status |
+|-----|----------------|-------------|-----|--------|
+| 1 | 0.19 m | 184 s | 228.5 deg | OK |
+| 2 | 0.17 m | 184 s | 228.5 deg | OK |
+| 3 | 0.18 m | 184 s | 228.5 deg | OK |
+| 4 | 0.18 m | 182 s | 228.5 deg | OK |
+| 5 | 0.19 m | 185 s | 228.5 deg | OK |
+| **Average** | **0.18 m** | **184 s** | | **5/5 OK** |
+
+Best result across all test sessions: **0.01 m** from target point B.
+
+---
+
+## Project Structure
 
 ```
-GPS telemetry + EKF velocity (dronekit)
+Test-Task-Autopilot/
+  flight.py            # Main flight controller (cascaded velocity control)
+  run_tests.py         # Automated 5-flight test runner with SITL/MAVProxy/FlightGear
+  sitl_extra.parm      # SITL parameter overrides (SERIAL1 for MAVProxy)
+  requirements.txt     # Python dependencies (dronekit, pymavlink)
+  results.txt          # Latest test run results
+  Test_fly_video.mov   # Full flight recording (original)
+  Test_fly_video_compressed.mp4  # Compressed flight recording
+  venv/                # Python virtual environment
+  logs/                # ArduPilot telemetry logs
+```
+
+---
+
+## How It Works
+
+### Control Architecture
+
+```
+GPS + EKF telemetry (dronekit)
         |
         v
-+--------------------------------------------------+
-|  Control loop  (~12.5 Hz)                         |
-|                                                   |
-|  Phase 1: TAKEOFF                                 |
-|    Altitude PI -> CH3 (throttle)                  |
-|    Yaw P -> CH4 (rotate to bearing A->B)          |
-|                                                   |
-|  Phase 2: CRUISE + GLIDE + FLARE                  |
-|    Outer loop: position P -> desired velocity     |
-|    Inner loop: velocity PI -> CH1/CH2             |
-|    EMA low-pass filter on body-frame velocities   |
-|    Altitude: PI (cruise) / PI+FF descent (glide)  |
-|    Yaw P -> CH4                                   |
-+--------------------------------------------------+
++-----------------------------------------------------------+
+|  Control loop (~12.5 Hz, dt=0.08s)                        |
+|                                                           |
+|  PHASE 1: TAKEOFF                                         |
+|    Altitude PI -> CH3 (throttle)                          |
+|    Yaw P -> CH4 (rotate to bearing A->B)                  |
+|                                                           |
+|  PHASE 2: CRUISE + GLIDE + FLARE                          |
+|    Outer loop: position error P -> desired velocity       |
+|    Inner loop: velocity error PI -> CH1 (roll), CH2 (pitch)|
+|    EMA low-pass filter on body-frame velocities            |
+|    Altitude: PI hold (cruise) / PI+FF descent (glide)     |
+|    Yaw P -> CH4 (maintain constant heading)                |
++-----------------------------------------------------------+
         |
         v
   RC Override CH1-4  ->  ArduCopter STABILIZE
 ```
 
-### Cascaded velocity controller (key innovation)
+### Cascaded Velocity Controller
 
-Traditional approach uses **position PI** directly -> RC commands. This reacts slowly to wind gusts (must wait for position change).
+The key innovation. Traditional position-PI controllers react to **position change** (slow — wind must blow the drone off course before correction begins). Our cascaded controller reacts to **velocity change** (fast — wind gust changes velocity before position):
 
-Our **cascaded controller** uses two loops:
-1. **Outer loop (position P):** position error -> desired velocity (`POS_KP * error`)
-2. **Inner loop (velocity PI):** velocity error -> RC pitch/roll (`VEL_KP * vel_err + VEL_KI * integral`)
+1. **Outer loop (Position P):** `desired_velocity = POS_KP * position_error`
+   - Converts position error (meters) to desired velocity (m/s)
+   - `POS_KP = 0.5` -> 1m error produces 0.5 m/s desired velocity
 
-The inner velocity loop reacts **immediately** to wind gusts (velocity changes before position does), providing much tighter position hold.
+2. **Inner loop (Velocity PI):** `RC_delta = VEL_KP * vel_error + VEL_KI * integral`
+   - Converts velocity error (m/s) to RC stick commands
+   - `VEL_KP = 55`, `VEL_KI = 8` -> reacts to wind gusts within 1-2 control cycles
+   - EMA filter (alpha=0.25) smooths noisy EKF velocity for stable control
 
-### Glide approach + Flare
+This architecture catches wind disturbances 5-10x faster than direct position control.
 
-Instead of flying to B at altitude and then descending (which causes wind drift),
-the drone follows an **18-degree glide slope** with a **35-degree steep final slope**:
+### Glide Approach
+
+Instead of flying to B at altitude and descending (wind drift during descent), the drone follows a continuous **glide slope**:
 
 ```
 200m ___________
-               \  glide_start = 615m from B
+               \  615m from B — glide starts
                 \
-                 \  18 deg slope
+                 \  18 deg slope (main descent)
                   \
-                   \_ 35 deg steep (last 20m)
+                   \_ 35 deg steep (last 20m from B)
                      |
-                     | FLARE (alt < 2m)
-                     v B (ground)
+                     | FLARE (alt < 2m, Vz = -0.8 m/s)
+                     v  B (touchdown)
 ```
 
-- Glide: continuous approach to B while descending (no hover phase)
-- Steep slope at dist < 20m: preserves altitude for position correction
-- Flare at alt < 2m: velocity controller holds position over B during final descent
-- Wind compensation: upwind aim offset (~15% of estimated drift for dist > 30m, fixed 4.5m for 5-30m)
+- **18-deg glide slope** from 615m out — continuous descent while maintaining forward progress
+- **35-deg steep slope** inside 20m — preserves altitude for final position correction
+- **Flare at alt < 2m** — slow descent (Vz=-0.8) while velocity controller holds position over B
+- **Wind compensation** — upwind aim offset (15% of drift estimate at >30m, fixed 4.5m at 5-30m)
 
-### Flight phases
+### Flight Phases
 
-| Phase | Description |
-|-------|-------------|
-| **1. Takeoff** | STABILIZE mode, aggressive climb to 200m with PI altitude hold. Yaw rotates to bearing A->B. |
-| **2. Cruise** | PI altitude hold at 200m, cascaded velocity nav (position P -> velocity PI) toward B. |
-| **3. Glide** | When dist <= 615m, target altitude follows glide slope. Descent rate PI + feedforward. Steep 35-deg slope in final 20m. |
-| **4. Flare** | When alt < 2m and dist < 10m: slow descent (Vz=-0.8), velocity controller holds position over B for precision touchdown. |
-
-### Key design decisions
-
-**Cascaded velocity control instead of direct position PI.**
-Position PI reacts to position changes (slow). Velocity PI reacts to velocity changes (fast). Wind gust changes velocity before position — cascaded control catches it 5-10x faster.
-
-**Glide approach instead of hover-then-descend.**
-Traditional: fly to B, hover, descend. Problem: during descent wind blows drone away from B. Glide approach eliminates this — drone is always moving toward B while descending.
-
-**Flare phase at 2m altitude.**
-At very low altitude, the steep slope transitions to a slow vertical descent while the velocity controller maintains position directly over B. This gives maximum precision at touchdown.
-
-**Body-frame conversion uses current yaw, not target yaw.**
-In STABILIZE mode, RC pitch/roll commands move the drone relative to its **current** heading. The NED->body rotation must use the actual yaw from telemetry, not the target FLIGHT_YAW.
-
-**EMA low-pass filter on velocities.**
-Raw EKF velocity has noise. The EMA filter (alpha=0.25) smooths body-frame velocities for stable control without significant lag.
-
-**Wind-compensated aim point.**
-During glide, the drone aims upwind from B (15% of estimated wind drift at dist > 30m, fixed 4.5m offset at 5-30m). This pre-compensates for residual drift the PI controller can't fully eliminate.
-
-**Constant Yaw = bearing A->B.**
-Pre-computed bearing **A -> B ~ 228.5 deg** is used as `FLIGHT_YAW`. Pointing the nose toward B simplifies control: pitch drives forward progress, roll corrects lateral drift.
+| Phase | Trigger | Description |
+|-------|---------|-------------|
+| **1. Takeoff** | Start | Climb to 200m in STABILIZE. Aggressive throttle (1680) below 3m, then PI altitude hold. Yaw rotates to bearing A->B (~228.5 deg). |
+| **2. Cruise** | Alt >= 199m | PI altitude hold at 200m. Cascaded velocity navigation toward B. Max speed 12 m/s. |
+| **3. Glide** | Dist <= 615m | Target altitude follows glide slope. Descent rate PI + feedforward controller. Max speed 8 m/s (3 m/s below 10m alt). |
+| **4. Flare** | Alt < 2m, Dist < 10m | Gentle descent at -0.8 m/s. Velocity controller maintains position directly over B. Touchdown at alt < 0.2m. |
 
 ---
 
-## Prerequisites
+## Version History
 
-```
-Python 3.8+
-ArduCopter SITL (via Mission Planner or sim_vehicle.py)
-```
+The controller evolved through 10 major iterations:
 
-```bash
-pip install dronekit pymavlink
-```
+| Version | Approach | Avg Distance | Avg Time | Notes |
+|---------|----------|:------------:|:--------:|-------|
+| v1 | Direct PI + descent rate | 9.76 m | ~600 s | Sometimes stuck at 41m from B |
+| v2 | CRUISE/FINE modes + wind descent | 28.01 m | 1188 s | No horizontal correction |
+| v3 | v1 + min control 150 | 10.10 m | ~480 s | Fixed stuck issue, still imprecise |
+| v5 | PI descent directly over B | 16.72 m | 253 s | Wind drift during descent |
+| v7 | **Glide 15-deg slope** | **3.49 m** | **208 s** | First glide approach |
+| v8 | Glide 18-deg + position PI | **3.22 m** | **185 s** | Optimized slope angle |
+| v9i | Upwind offset + steep final | **1.07 m** | **187 s** | 3/5 runs under 1m |
+| **v10** | **Cascaded velocity control** | **0.07 m** | **183 s** | **Production version** |
 
-**Note on Python 3.10+:** dronekit may require patching `collections.MutableMapping` imports. The script includes an automatic compatibility patch.
-
----
-
-## SITL Setup
-
-### Option A — Mission Planner (Windows)
-
-1. Open Mission Planner -> **Simulation** tab
-2. Set **Home Location**: `50.450739, 30.461242`
-3. Click **ArduCopter** -> wait for SITL to start
-4. Mission Planner connects automatically on UDP 14550
-
-### Option B — sim_vehicle.py (Linux/Mac)
-
-```bash
-cd ArduCopter
-sim_vehicle.py \
-  -v ArduCopter \
-  --location=50.450739,30.461242,0,0 \
-  --out=udp:127.0.0.1:14550 \
-  --console --map
-```
-
-### Option C — Direct SITL binary (no MAVProxy)
-
-```bash
-arducopter --model + --speedup 1 \
-  --defaults Tools/autotest/default_params/copter.parm \
-  --home 50.450739,30.461242,0,0 -I0
-# Connects on tcp:127.0.0.1:5760
-```
+Key breakthroughs:
+- **v7**: Glide approach eliminated the hover-then-descend problem (28m -> 3.5m)
+- **v10**: Cascaded velocity controller eliminated wind-induced position drift (3.5m -> 0.07m)
 
 ---
 
-## Running the script
+## Automated Test Runner
 
-```bash
-# Default — connects to udp:127.0.0.1:14550
-python flight.py
+`run_tests.py` runs 5 consecutive SITL flights automatically and collects statistics.
 
-# Custom connection string
-python flight.py --connect tcp:127.0.0.1:5760
+### Architecture
+
+```
+                         SITL (arducopter -I1)
+                        /          |          \
+                       /           |           \
+              TCP:5770      TCP:5772       UDP:5513
+            (SERIAL0)      (SERIAL1)     (FG_VIEW)
+                |              |              |
+           flight.py      MAVProxy      FlightGear
+          (controller)   (2D map +     (3D drone
+                          console)       view)
+```
+
+Each SITL instance exposes multiple serial ports. This allows flight.py and MAVProxy to connect **independently** without port conflicts:
+
+- **SERIAL0 (TCP:5770)** — flight.py connects here for vehicle control
+- **SERIAL1 (TCP:5772)** — MAVProxy connects here for monitoring (console + map)
+- **FG_VIEW (UDP:5513)** — FlightGear receives FDM data for 3D visualization
+
+### What it does
+
+1. Launches **FlightGear** once (persists across all flights — terrain takes time to load)
+2. For each of 5 flights:
+   - Kills previous SITL + MAVProxy processes
+   - Starts fresh **SITL** instance (`arducopter -I1`)
+   - Starts **MAVProxy** in a new Terminal.app window (console + map)
+   - Runs **flight.py** and parses output for distance, time, yaw
+   - Streams flight output in real-time
+3. Displays statistics table and saves results to `results.txt`
+
+### Configuration
+
+Key settings in `run_tests.py`:
+
+| Setting | Value | Description |
+|---------|-------|-------------|
+| `NUM_FLIGHTS` | 5 | Number of test flights |
+| `PAUSE_BETWEEN` | 10s | Pause between flights |
+| `SITL_INSTANCE` | 1 | SITL instance number (-I1) |
+| `SITL_HOME` | `50.450739,30.461242,160,0` | Home position (160m MSL for Kyiv) |
+| `FLIGHT_TIMEOUT` | 360s | Max time per flight |
+
+### SITL Extra Parameters
+
+`sitl_extra.parm` enables MAVLink on SERIAL1 for MAVProxy:
+
+```
+SERIAL1_PROTOCOL 2      # MAVLink2
+SERIAL1_BAUD 921600     # High baud rate
 ```
 
 ---
 
-## Tuning guide
+## Visualization
 
-| Parameter | Effect |
-|-----------|--------|
-| `HOVER_THROTTLE` | If drone climbs at 1500 -> lower; descends -> raise |
-| `ALT_KP` / `ALT_KI` | Altitude response speed and steady-state accuracy |
-| `POS_KP` | Outer loop: m/s of desired velocity per m of position error |
-| `VEL_KP` / `VEL_KI` | Inner loop: RC delta per m/s of velocity error |
-| `MAX_VEL_*` | Speed limits for cruise/glide/low altitude |
-| `YAW_KP` | Larger = faster yaw corrections |
-| `GLIDE_ANGLE_DEG` | Steeper = shorter glide, faster flight; shallower = more gradual |
-| `DESCENT_KP` / `DESCENT_KI` | Descent rate tracking accuracy |
-| `DESCENT_FF` | Feedforward gain — critical for overcoming hover throttle |
-| `WIND_SPD` / `WIND_DIR_DEG` | Must match SITL wind params for aim offset calculation |
-| `VEL_EMA_ALPHA` | Velocity filter: lower = smoother, higher = more responsive |
+### MAVProxy (2D Map + Console)
 
-In SITL the default hover throttle is usually **1500** (THR\_MID = 500 -> maps to RC 1500).
+MAVProxy provides real-time 2D map tracking and telemetry console. Launched automatically by `run_tests.py` in a separate Terminal window on SERIAL1 (TCP:5772).
+
+### FlightGear (3D Drone View)
+
+FlightGear provides 3D visualization of the drone flight. Enabled via SITL's `--enable-fgview` flag, which sends FDM (Flight Dynamics Model) data over UDP to FlightGear.
+
+**Important**: SITL home altitude must match real-world MSL altitude. For Kyiv coordinates, this is ~160m. Without this, FlightGear renders the drone underground (shows negative altitude).
+
+---
+
+## Setup & Installation
+
+### Prerequisites
+
+- **Python 3.8+** (tested with 3.10+)
+- **ArduPilot SITL** — compiled `arducopter` binary
+- **MAVProxy** (optional, for 2D visualization)
+- **FlightGear** (optional, for 3D visualization)
+
+### Install
+
+```bash
+# Clone or copy the project
+cd Test-Task-Autopilot
+
+# Create virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Install dependencies
+pip install dronekit pymavlink MAVProxy
+```
+
+### Build ArduPilot SITL (if not already built)
+
+```bash
+cd ~/ardupilot
+./waf configure --board sitl
+./waf copter
+# Binary: build/sitl/bin/arducopter
+```
+
+### Install FlightGear (macOS)
+
+```bash
+brew install --cask flightgear
+```
+
+---
+
+## Running
+
+### Single flight (manual SITL)
+
+```bash
+# Terminal 1 — Start SITL
+~/ardupilot/build/sitl/bin/arducopter \
+  --model + --speedup 1 \
+  --defaults ~/ardupilot/Tools/autotest/default_params/copter.parm \
+  --home 50.450739,30.461242,160,0 -I1
+
+# Terminal 2 — Run flight
+source venv/bin/activate
+python flight.py --connect tcp:127.0.0.1:5770
+```
+
+### Automated test suite (recommended)
+
+```bash
+source venv/bin/activate
+python run_tests.py
+```
+
+This launches SITL, MAVProxy, and FlightGear automatically, runs 5 flights, and saves results.
+
+---
+
+## Controller Tuning
+
+| Parameter | Default | Effect |
+|-----------|---------|--------|
+| `HOVER_THROTTLE` | 1500 | Base throttle for hover. Adjust if drone drifts vertically at neutral. |
+| `ALT_KP` / `ALT_KI` | 3.5 / 0.15 | Altitude PI — controls climb/descent accuracy during cruise. |
+| `POS_KP` | 0.5 | Outer loop gain. Higher = more aggressive position correction. |
+| `VEL_KP` / `VEL_KI` | 55 / 8 | Inner loop PI — translates velocity error to RC commands. |
+| `VEL_EMA_ALPHA` | 0.25 | Velocity smoothing. Lower = smoother but laggier. |
+| `MAX_VEL_CRUISE` | 12 m/s | Speed limit during level cruise. |
+| `MAX_VEL_GLIDE` | 8 m/s | Speed limit during glide descent. |
+| `MAX_VEL_LOW` | 3 m/s | Speed limit below 10m altitude. |
+| `GLIDE_ANGLE_DEG` | 18 deg | Glide slope. Steeper = faster but less position correction time. |
+| `DESCENT_KP` / `DESCENT_KI` | 50 / 3 | Descent rate PI — tracks target Vz during glide. |
+| `DESCENT_FF` | 65 | Feedforward — overcomes hover throttle for descent. Critical parameter. |
+| `YAW_KP` | 4.0 | Yaw P gain. Higher = snappier heading hold. |
+
+### Python 3.10+ Compatibility
+
+dronekit uses deprecated `collections.MutableMapping` which was removed in Python 3.10. The script includes an automatic compatibility patch (lines 29-31 of `flight.py`) — no manual intervention needed.

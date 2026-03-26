@@ -226,6 +226,10 @@ def main(connection_string):
     print(f"  Glide start dist: {GLIDE_START_DIST:.0f} m from B")
     print("=" * 65)
 
+    import logging
+    logging.getLogger("dronekit").setLevel(logging.CRITICAL)
+    logging.getLogger("dronekit.mavlink").setLevel(logging.CRITICAL)
+
     print(f"\nConnecting to {connection_string} ...")
     vehicle = connect(connection_string, wait_ready=True, timeout=60)
     print(f"Connected  |  FW: {vehicle.version}  |  Mode: {vehicle.mode.name}")

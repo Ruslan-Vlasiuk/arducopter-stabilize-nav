@@ -6,3 +6,9 @@ eeprom.bin
 logs/
 terrain/
 *.bin
+*.mov
+*.mp4
+mav.parm
+mav.tlog
+mav.tlog.raw
+mavproxy.log
