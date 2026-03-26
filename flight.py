@@ -55,7 +55,7 @@ NAV_KP           = 3.0      # (m error) → RC delta
 NAV_KI           = 0.15     # integral gain for wind-induced position drift
 NAV_I_MAX        = 120.0    # anti-windup clamp for position integrator
 NAV_MAX_CTRL     = 350      # max RC deviation for pitch/roll (needs to overcome wind)
-SLOWDOWN_RADIUS  = 150.0    # m — start reducing speed here (larger = smoother approach)
+SLOWDOWN_RADIUS  = 60.0     # m — start reducing speed here
 ARRIVAL_RADIUS   = 15.0     # m — "at target B" (needs margin for wind)
 
 # ── Yaw P-controller ───────────────────────────────────────────
@@ -403,7 +403,7 @@ def _run_flight(vehicle, FLIGHT_YAW, DIST_TOTAL):
             max_ctrl = NAV_MAX_CTRL  # full authority
         else:
             spd_scale = dist / SLOWDOWN_RADIUS
-            max_ctrl = max(NAV_MAX_CTRL * spd_scale, 80)  # min 80 for wind compensation
+            max_ctrl = max(NAV_MAX_CTRL * spd_scale, 150)  # min 150 for wind compensation
 
         # PI control for position
         nav_fwd_integral = clamp(nav_fwd_integral + fwd * LOOP_DT,
@@ -416,10 +416,10 @@ def _run_flight(vehicle, FLIGHT_YAW, DIST_TOTAL):
         roll_delta  = clamp(NAV_KP * rgt + NAV_KI * nav_rgt_integral,
                             -max_ctrl, max_ctrl)
 
-        # Reset integrators when close to avoid overshoot
-        if dist < ARRIVAL_RADIUS * 3:
-            nav_fwd_integral *= 0.9
-            nav_rgt_integral *= 0.9
+        # Gently decay integrators when very close to avoid overshoot
+        if dist < ARRIVAL_RADIUS:
+            nav_fwd_integral *= 0.95
+            nav_rgt_integral *= 0.95
 
         # ArduCopter convention:
         #   CH2 < 1500 -> nose down  -> fly forward
@@ -500,7 +500,7 @@ def _run_flight(vehicle, FLIGHT_YAW, DIST_TOTAL):
         nav_rgt_integral = clamp(nav_rgt_integral + rgt * LOOP_DT, -NAV_I_MAX, NAV_I_MAX)
 
         spd_scale = min(1.0, dist_to_dp / 40.0)
-        max_c = max(NAV_MAX_CTRL * spd_scale, 80)
+        max_c = max(NAV_MAX_CTRL * spd_scale, 150)
         ch2 = RC_MID - int(clamp(NAV_KP * fwd + NAV_KI * nav_fwd_integral, -max_c, max_c))
         ch1 = RC_MID + int(clamp(NAV_KP * rgt + NAV_KI * nav_rgt_integral, -max_c, max_c))
         ch4 = ch4_for_yaw(yaw, FLIGHT_YAW)
