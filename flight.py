@@ -48,23 +48,23 @@ ALT_I_MAX = 120.0
 ALT_MAX_DELTA = 350
 
 # -- Navigation PI
-NAV_KP = 3.0
-NAV_KI = 0.15
-NAV_I_MAX = 120.0
-NAV_MAX_CTRL = 350
+NAV_KP = 3.5
+NAV_KI = 0.2
+NAV_I_MAX = 150.0
+NAV_MAX_CTRL = 380
 
 # -- Yaw P
 YAW_KP = 4.0
 YAW_DEADZONE = 0.5
 
 # -- Glide parameters
-GLIDE_ANGLE_DEG = 15.0   # glide slope angle
-GLIDE_START_DIST = TARGET_ALT / math.tan(math.radians(GLIDE_ANGLE_DEG))  # ~746m
+GLIDE_ANGLE_DEG = 18.0   # steeper glide = start closer to B, faster flight
+GLIDE_START_DIST = TARGET_ALT / math.tan(math.radians(GLIDE_ANGLE_DEG))  # ~615m
 
 # -- Descent rate controller (PI + feedforward)
-DESCENT_KP = 40.0
-DESCENT_KI = 2.0
-DESCENT_FF = 60.0   # feedforward: thr = HOVER - FF * |target_vz|
+DESCENT_KP = 50.0
+DESCENT_KI = 3.0
+DESCENT_FF = 65.0   # feedforward: thr = HOVER - FF * |target_vz|
 
 # -- Wind parameters for aim point compensation
 WIND_SPD = 3.0
@@ -427,22 +427,21 @@ def _run_flight(vehicle, FLIGHT_YAW, DIST_TOTAL):
             # Desired descent rate based on altitude error from glide slope
             alt_err_glide = target_alt - alt  # negative if above glide slope
 
-            # Target Vz: base rate from closing speed + correction for glide slope error
-            # If we're above glide slope, descend faster; below, slower
-            if alt > 5:
-                target_vz = -2.5 + alt_err_glide * 0.1  # adjust rate based on slope error
-            elif alt > 2:
-                target_vz = -0.8
+            # Target Vz: base rate + correction for glide slope error
+            if alt > 10:
+                target_vz = -3.0 + alt_err_glide * 0.15  # faster base descent
+            elif alt > 3:
+                target_vz = -1.2  # still descending actively
             else:
-                target_vz = -0.4
+                target_vz = -0.6  # gentle but not crawling
 
             # Corrections for large deviations from glide slope
             if alt > target_alt + 5:
-                target_vz -= 1.0  # above slope, drop faster
+                target_vz -= 1.5  # above slope, drop faster
             if alt < target_alt - 3:
-                target_vz += 1.5  # below slope, slow down
+                target_vz += 2.0  # below slope, slow down
 
-            target_vz = clamp(target_vz, -8.0, 0.0)
+            target_vz = clamp(target_vz, -8.0, -0.3)
 
             # Descent rate PI controller + feedforward
             vz_err = target_vz - vz_filtered
