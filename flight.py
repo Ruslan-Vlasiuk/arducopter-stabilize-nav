@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ArduCopter STABILIZE Flight -- RC Override Navigation (Glide approach)
+ArduCopter STABILIZE Flight -- RC Override Navigation (Cascaded Velocity Control)
 
 A (start) : 50.450739, 30.461242
 B (target): 50.443326, 30.448078
@@ -8,8 +8,14 @@ Altitude  : 200 m
 
 Phases:
   1. Takeoff in STABILIZE -> 200 m
-  2. Cruise + Glide: fly toward B, begin descent at glide_start_dist,
-     arrive at B at altitude 0. No hover, no separate landing phase.
+  2. Cruise: PI altitude hold at 200m, cascaded velocity nav toward B
+  3. Glide: 18-deg slope to B, steep 35-deg in final 20m
+  4. Flare (alt < 2m): reduce descent rate, maintain approach velocity
+
+Navigation: cascaded controller
+  Outer loop: position P -> desired velocity
+  Inner loop: velocity PI -> RC pitch/roll
+  Low-pass EMA filter on all velocities
 """
 
 import time
@@ -47,11 +53,21 @@ ALT_KI = 0.15
 ALT_I_MAX = 120.0
 ALT_MAX_DELTA = 350
 
-# -- Navigation PI
-NAV_KP = 3.5
-NAV_KI = 0.2
-NAV_I_MAX = 150.0
-NAV_MAX_CTRL = 380
+# -- Cascaded navigation controller
+#    Outer loop: position P -> desired velocity (m/s)
+POS_KP = 0.5             # m/s per m of error
+MAX_VEL_CRUISE = 12.0    # max desired speed during cruise
+MAX_VEL_GLIDE = 8.0      # max during high-alt glide
+MAX_VEL_LOW = 3.0        # max during low-alt glide (< 10m)
+
+#    Inner loop: velocity PI -> RC delta
+VEL_KP = 55.0            # RC units per m/s of velocity error
+VEL_KI = 8.0             # RC units per m*s of integrated velocity error
+VEL_I_MAX = 200.0        # integral clamp
+NAV_MAX_CTRL = 380       # RC output clamp
+
+# -- Velocity EMA filter
+VEL_EMA_ALPHA = 0.25     # low-pass filter on body-frame velocities
 
 # -- Yaw P
 YAW_KP = 4.0
@@ -159,6 +175,7 @@ _last_valid_lon = 0.0
 _last_valid_alt = 0.0
 
 def get_state(vehicle):
+    """Returns (lat, lon, alt, yaw_deg, vx, vy, vz) where vx/vy/vz are NED m/s."""
     global _last_valid_lat, _last_valid_lon, _last_valid_alt
     loc = vehicle.location.global_relative_frame
     lat = loc.lat
@@ -176,7 +193,14 @@ def get_state(vehicle):
 
     yaw_rad = vehicle.attitude.yaw
     yaw_d = (math.degrees(yaw_rad) + 360.0) % 360.0
-    return (lat, lon, alt, yaw_d)
+
+    # NED velocity from EKF
+    vel = vehicle.velocity
+    vx = vel[0] if vel and vel[0] is not None else 0.0
+    vy = vel[1] if vel and vel[1] is not None else 0.0
+    vz = vel[2] if vel and vel[2] is not None else 0.0
+
+    return (lat, lon, alt, yaw_d, vx, vy, vz)
 
 def ch4_for_yaw(current_yaw, target_yaw):
     err = wrap180(target_yaw - current_yaw)
@@ -230,7 +254,7 @@ def main(connection_string):
     else:
         print("\n  WARNING: GPS/EKF timeout")
 
-    lat0, lon0, alt0, _ = get_state(vehicle)
+    lat0, lon0, alt0, _, _, _, _ = get_state(vehicle)
     home_dist = haversine_m(lat0, lon0, *POINT_A)
     print(f"  Current position: {lat0:.6f}, {lon0:.6f}")
     print(f"  Distance from Point A: {home_dist:.1f} m")
@@ -273,7 +297,7 @@ def main(connection_string):
         except Exception:
             pass
 
-        lat, lon, alt, _ = get_state(vehicle)
+        lat, lon, alt, _, _, _, _ = get_state(vehicle)
         final_dist = haversine_m(lat, lon, *POINT_B)
 
         print("\n" + "=" * 65)
@@ -306,7 +330,7 @@ def _run_flight(vehicle, FLIGHT_YAW, DIST_TOTAL):
     alt_integral = 0.0
     t0 = time.time()
     while True:
-        lat, lon, alt, yaw = get_state(vehicle)
+        lat, lon, alt, yaw, _, _, _ = get_state(vehicle)
         alt_err = TARGET_ALT - alt
 
         if alt < 3.0:
@@ -337,70 +361,100 @@ def _run_flight(vehicle, FLIGHT_YAW, DIST_TOTAL):
         time.sleep(LOOP_DT)
 
     # ==============================================================
-    # PHASE 2 -- CRUISE + GLIDE to B
+    # PHASE 2 -- CRUISE + GLIDE to B (PID nav, fast descent)
+    # ==============================================================
+    # PHASE 2 -- CRUISE + GLIDE + FLARE to B (Cascaded Velocity Control)
     # ==============================================================
     print(f"\n{'-'*65}")
-    print(f"  PHASE 2 -- CRUISE + GLIDE -> Point B ({DIST_TOTAL:.0f}m)")
+    print(f"  PHASE 2 -- CRUISE + GLIDE + FLARE -> Point B ({DIST_TOTAL:.0f}m)")
     print(f"  Glide starts at {GLIDE_START_DIST:.0f}m from B")
+    print(f"  Cascaded nav: position P -> desired velocity -> velocity PI -> RC")
     print(f"  Constant YAW = {FLIGHT_YAW:.1f} deg")
     print(f"{'-'*65}")
 
     # Calculate wind-compensated aim point
-    # Wind blows FROM WIND_DIR, drifts drone toward WIND_DIR+180
-    # Aim UPWIND so wind carries drone toward B
-    # Estimate time in glide: glide_start_dist / ground_speed (~8 m/s)
     est_glide_time = GLIDE_START_DIST / 8.0
     wind_drift = WIND_SPD * est_glide_time
-    # Aim point is offset UPWIND from B (toward wind source)
     aim_lat, aim_lon = offset_point(POINT_B[0], POINT_B[1], WIND_DIR_DEG, wind_drift * 0.15)
     aim_dist = haversine_m(aim_lat, aim_lon, *POINT_B)
     print(f"  Wind aim offset: {aim_dist:.0f}m upwind from B")
 
     alt_integral = 0.0
-    nav_fwd_integral = 0.0
-    nav_rgt_integral = 0.0
+    vel_fwd_integral = 0.0
+    vel_rgt_integral = 0.0
     vz_filtered = 0.0
     vz_integral = 0.0
     prev_alt = alt
+
+    # EMA-filtered horizontal velocities (body frame)
+    vfwd_ema = 0.0
+    vrgt_ema = 0.0
+
     t_prev = time.time()
     t0 = time.time()
     gliding = False
+    flaring = False
 
     while True:
         t_now = time.time()
         dt_actual = max(t_now - t_prev, 0.01)
         t_prev = t_now
 
-        lat, lon, alt, yaw = get_state(vehicle)
+        lat, lon, alt, yaw, vx_ned, vy_ned, vz_ned = get_state(vehicle)
         dist_b = haversine_m(lat, lon, *POINT_B)
 
-        # Determine if we're in glide phase
+        # Convert NED velocity to body frame and low-pass filter
+        v_fwd_raw, v_rgt_raw = ned_to_body(vx_ned, vy_ned, yaw)
+        vfwd_ema = (1 - VEL_EMA_ALPHA) * vfwd_ema + VEL_EMA_ALPHA * v_fwd_raw
+        vrgt_ema = (1 - VEL_EMA_ALPHA) * vrgt_ema + VEL_EMA_ALPHA * v_rgt_raw
+        hspeed = math.sqrt(vfwd_ema**2 + vrgt_ema**2)
+
+        # Phase transitions
         if not gliding and dist_b <= GLIDE_START_DIST:
             gliding = True
             print(f"\n  === GLIDE START at dist={dist_b:.0f}m alt={alt:.0f}m ===")
             vz_integral = 0.0
 
-        # -- Navigation: aim at B (or wind-compensated aim point during glide)
+        if gliding and not flaring and alt < 2.0 and dist_b < 10:
+            flaring = True
+            print(f"\n  === FLARE at dist={dist_b:.1f}m alt={alt:.1f}m hspd={hspeed:.1f} ===")
+
+        # -- Navigation target with wind compensation
         if gliding and dist_b > 30:
-            # Aim upwind to compensate for drift during descent
             nav_target = (aim_lat, aim_lon)
+        elif gliding and dist_b > 5:
+            # Fixed upwind offset to counter residual wind drift
+            nav_target = offset_point(POINT_B[0], POINT_B[1], WIND_DIR_DEG, 4.5)
         else:
             nav_target = POINT_B
 
+        # Position error in body frame
         n_err, e_err = ned_offset_m(lat, lon, *nav_target)
-        fwd, rgt = ned_to_body(n_err, e_err, yaw)
+        fwd_err, rgt_err = ned_to_body(n_err, e_err, yaw)
 
-        # Nav PI
-        nav_fwd_integral = clamp(nav_fwd_integral + fwd * LOOP_DT, -NAV_I_MAX, NAV_I_MAX)
-        nav_rgt_integral = clamp(nav_rgt_integral + rgt * LOOP_DT, -NAV_I_MAX, NAV_I_MAX)
+        # === CASCADED NAV CONTROLLER ===
+        # Outer loop: position P -> desired velocity
+        if gliding and alt < 10:
+            max_vel = MAX_VEL_LOW
+        elif gliding:
+            max_vel = MAX_VEL_GLIDE
+        else:
+            max_vel = MAX_VEL_CRUISE
 
-        # Boost nav gains at low altitude for precision landing
-        kp = NAV_KP * (1.5 if (gliding and alt < 15) else 1.0)
-        ki = NAV_KI * (1.5 if (gliding and alt < 15) else 1.0)
+        desired_vel_fwd = clamp(POS_KP * fwd_err, -max_vel, max_vel)
+        desired_vel_rgt = clamp(POS_KP * rgt_err, -max_vel, max_vel)
 
-        nav_max = NAV_MAX_CTRL
-        pitch_delta = clamp(kp * fwd + ki * nav_fwd_integral, -nav_max, nav_max)
-        roll_delta = clamp(kp * rgt + ki * nav_rgt_integral, -nav_max, nav_max)
+        # Inner loop: velocity PI -> RC delta
+        vel_err_fwd = desired_vel_fwd - vfwd_ema
+        vel_err_rgt = desired_vel_rgt - vrgt_ema
+
+        vel_fwd_integral = clamp(vel_fwd_integral + vel_err_fwd * dt_actual, -VEL_I_MAX, VEL_I_MAX)
+        vel_rgt_integral = clamp(vel_rgt_integral + vel_err_rgt * dt_actual, -VEL_I_MAX, VEL_I_MAX)
+
+        pitch_delta = clamp(VEL_KP * vel_err_fwd + VEL_KI * vel_fwd_integral,
+                            -NAV_MAX_CTRL, NAV_MAX_CTRL)
+        roll_delta = clamp(VEL_KP * vel_err_rgt + VEL_KI * vel_rgt_integral,
+                           -NAV_MAX_CTRL, NAV_MAX_CTRL)
 
         ch2 = RC_MID - int(pitch_delta)
         ch1 = RC_MID + int(roll_delta)
@@ -418,52 +472,59 @@ def _run_flight(vehicle, FLIGHT_YAW, DIST_TOTAL):
             thr = int(clamp(HOVER_THROTTLE + ALT_KP * alt_err + ALT_KI * alt_integral,
                             RC_MIN, RC_MAX))
             phase_str = "CRUISE"
-        else:
-            # Glide -- target altitude follows glide slope
-            # target_alt = dist_to_B * tan(glide_angle)
-            target_alt = dist_b * math.tan(math.radians(GLIDE_ANGLE_DEG))
-            target_alt = max(target_alt, 0.0)
-
-            # Desired descent rate based on altitude error from glide slope
-            alt_err_glide = target_alt - alt  # negative if above glide slope
-
-            # Target Vz: base rate + correction for glide slope error
-            if alt > 10:
-                target_vz = -3.0 + alt_err_glide * 0.15  # faster base descent
-            elif alt > 3:
-                target_vz = -1.2  # still descending actively
-            else:
-                target_vz = -0.6  # gentle but not crawling
-
-            # Corrections for large deviations from glide slope
-            if alt > target_alt + 5:
-                target_vz -= 1.5  # above slope, drop faster
-            if alt < target_alt - 3:
-                target_vz += 2.0  # below slope, slow down
-
-            target_vz = clamp(target_vz, -8.0, -0.3)
-
-            # Descent rate PI controller + feedforward
+        elif flaring:
+            # FLARE: moderate descent over B, velocity controller holds position
+            target_vz = -0.8
             vz_err = target_vz - vz_filtered
             vz_integral = clamp(vz_integral + vz_err * dt_actual, -50, 50)
             thr = int(clamp(
                 HOVER_THROTTLE - DESCENT_FF * abs(target_vz) + DESCENT_KP * vz_err + DESCENT_KI * vz_integral,
                 RC_MIN, RC_MAX
             ))
+            phase_str = f"FLARE d={dist_b:4.1f}"
+        else:
+            # Glide -- target altitude follows glide slope
+            if dist_b < 20:
+                glide_tan = math.tan(math.radians(35.0))
+            else:
+                glide_tan = math.tan(math.radians(GLIDE_ANGLE_DEG))
+            target_alt = max(dist_b * glide_tan, 0.0)
 
+            alt_err_glide = target_alt - alt
+
+            if alt > 10:
+                target_vz = -3.0 + alt_err_glide * 0.15
+            elif alt > 3:
+                target_vz = -1.2
+            else:
+                target_vz = -0.6
+
+            if alt > target_alt + 5:
+                target_vz -= 1.5
+            if alt < target_alt - 3:
+                target_vz += 2.0
+
+            target_vz = clamp(target_vz, -8.0, -0.3)
+
+            vz_err = target_vz - vz_filtered
+            vz_integral = clamp(vz_integral + vz_err * dt_actual, -50, 50)
+            thr = int(clamp(
+                HOVER_THROTTLE - DESCENT_FF * abs(target_vz) + DESCENT_KP * vz_err + DESCENT_KI * vz_integral,
+                RC_MIN, RC_MAX
+            ))
             phase_str = f"GLIDE t_alt={target_alt:5.1f}"
 
         rc_override(vehicle, roll=ch1, pitch=ch2, throttle=thr, yaw=ch4)
 
         sys.stdout.write(
-            f"\r  [{phase_str}]  Dist {dist_b:7.1f}m  Alt {alt:6.1f}m  "
-            f"Thr {thr}  Vz {vz_filtered:+5.1f}  Yaw {yaw:5.1f}   "
+            f"\r  [{phase_str}]  Dist {dist_b:6.1f}m  Alt {alt:5.1f}m  "
+            f"Thr {thr}  Vz {vz_filtered:+5.1f}  Hspd {hspeed:4.1f}  "
         )
         sys.stdout.flush()
 
         # Touchdown detection
-        if gliding and (alt < 0.3 or not vehicle.armed):
-            print(f"\n  Touchdown!  dist from B = {dist_b:.2f} m")
+        if gliding and (alt < 0.2 or not vehicle.armed):
+            print(f"\n  Touchdown!  dist from B = {dist_b:.2f} m  hspd = {hspeed:.2f} m/s")
             break
 
         if time.time() - t0 > TIMEOUT_FLIGHT:
