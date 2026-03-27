@@ -1,23 +1,19 @@
-Flight Test Results — 2026-03-26 21:45:31
+Flight Test Results — 2026-03-26 22:48:31
 =================================================================
 
 SITL: /Users/ruslan/ardupilot/build/sitl/bin/arducopter
 Home: 50.450739,30.461242,160,0
 Connection: tcp:127.0.0.1:5770
-Flights: 5
+Flights: 1
 
 Run      Distance     Time      Yaw   Status
 ------ ---------- -------- -------- --------
-1           0.19m     184s   228.5°       OK
-2           0.17m     184s   228.5°       OK
-3           0.18m     184s   228.5°       OK
-4           0.18m     182s   228.5°       OK
-5           0.19m     185s   228.5°       OK
+1           0.21m     181s   228.5°       OK
 
 =================================================================
-Average distance : 0.18 m
-Best distance    : 0.17 m
-Worst distance   : 0.19 m
-Average time     : 184 s
+Average distance : 0.21 m
+Best distance    : 0.21 m
+Worst distance   : 0.21 m
+Average time     : 181 s
 Average yaw      : 228.5 deg
-Success rate     : 5/5
+Success rate     : 1/1

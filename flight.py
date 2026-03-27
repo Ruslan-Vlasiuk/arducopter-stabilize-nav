@@ -266,7 +266,7 @@ def main(connection_string):
     # Wind parameters
     print("\nApplying SITL wind parameters ...")
     params = {
-        'SIM_WIND_SPD': 3,
+        'SIM_WIND_SPD': WIND_SPD,
         'SIM_WIND_DIR': 30,
         'SIM_WIND_TURB': 2,
         'SIM_WIND_TURB_FREQ': 0.2,
@@ -376,13 +376,6 @@ def _run_flight(vehicle, FLIGHT_YAW, DIST_TOTAL):
     print(f"  Constant YAW = {FLIGHT_YAW:.1f} deg")
     print(f"{'-'*65}")
 
-    # Calculate wind-compensated aim point
-    est_glide_time = GLIDE_START_DIST / 8.0
-    wind_drift = WIND_SPD * est_glide_time
-    aim_lat, aim_lon = offset_point(POINT_B[0], POINT_B[1], WIND_DIR_DEG, wind_drift * 0.15)
-    aim_dist = haversine_m(aim_lat, aim_lon, *POINT_B)
-    print(f"  Wind aim offset: {aim_dist:.0f}m upwind from B")
-
     alt_integral = 0.0
     vel_fwd_integral = 0.0
     vel_rgt_integral = 0.0
@@ -393,6 +386,11 @@ def _run_flight(vehicle, FLIGHT_YAW, DIST_TOTAL):
     # EMA-filtered horizontal velocities (body frame)
     vfwd_ema = 0.0
     vrgt_ema = 0.0
+
+    # Online wind estimation (NED frame, EMA-filtered)
+    wind_n_est = 0.0
+    wind_e_est = 0.0
+    WIND_EST_ALPHA = 0.005  # very slow EMA for stable estimate
 
     t_prev = time.time()
     t0 = time.time()
@@ -423,12 +421,31 @@ def _run_flight(vehicle, FLIGHT_YAW, DIST_TOTAL):
             flaring = True
             print(f"\n  === FLARE at dist={dist_b:.1f}m alt={alt:.1f}m hspd={hspeed:.1f} ===")
 
-        # -- Navigation target with wind compensation
-        if gliding and dist_b > 30:
-            nav_target = (aim_lat, aim_lon)
-        elif gliding and dist_b > 5:
-            # Fixed upwind offset to counter residual wind drift
-            nav_target = offset_point(POINT_B[0], POINT_B[1], WIND_DIR_DEG, 4.5)
+        # -- Online wind estimation from velocity PI integrals
+        #    The integrals accumulate to fight steady wind; convert back to NED
+        yaw_rad = math.radians(yaw)
+        wind_fwd = vel_fwd_integral * VEL_KI / VEL_KP
+        wind_rgt = vel_rgt_integral * VEL_KI / VEL_KP
+        wind_n_raw = wind_fwd * math.cos(yaw_rad) - wind_rgt * math.sin(yaw_rad)
+        wind_e_raw = wind_fwd * math.sin(yaw_rad) + wind_rgt * math.cos(yaw_rad)
+        wind_n_est = (1 - WIND_EST_ALPHA) * wind_n_est + WIND_EST_ALPHA * wind_n_raw
+        wind_e_est = (1 - WIND_EST_ALPHA) * wind_e_est + WIND_EST_ALPHA * wind_e_raw
+
+        # -- Adaptive navigation target
+        if gliding and dist_b > 10:
+            # Feedforward: offset aim point upwind based on estimated wind and time-to-arrive
+            est_time_to_b = dist_b / max(hspeed, 1.0)
+            offset_n = wind_n_est * est_time_to_b * 0.15
+            offset_e = wind_e_est * est_time_to_b * 0.15
+            # Cap offset to prevent runaway
+            max_offset = min(dist_b * 0.3, 30.0)
+            offset_mag = math.sqrt(offset_n**2 + offset_e**2)
+            if offset_mag > max_offset and offset_mag > 0:
+                offset_n *= max_offset / offset_mag
+                offset_e *= max_offset / offset_mag
+            nav_lat = POINT_B[0] + offset_n / 111320.0
+            nav_lon = POINT_B[1] + offset_e / (111320.0 * math.cos(math.radians(POINT_B[0])))
+            nav_target = (nav_lat, nav_lon)
         else:
             nav_target = POINT_B
 
@@ -444,6 +461,10 @@ def _run_flight(vehicle, FLIGHT_YAW, DIST_TOTAL):
             max_vel = MAX_VEL_GLIDE
         else:
             max_vel = MAX_VEL_CRUISE
+
+        # Final approach deceleration — smooth braking in last 10m to B
+        if gliding and dist_b < 10:
+            max_vel = min(max_vel, max(0.5, dist_b * 0.25))
 
         desired_vel_fwd = clamp(POS_KP * fwd_err, -max_vel, max_vel)
         desired_vel_rgt = clamp(POS_KP * rgt_err, -max_vel, max_vel)
@@ -538,6 +559,12 @@ def _run_flight(vehicle, FLIGHT_YAW, DIST_TOTAL):
         time.sleep(LOOP_DT)
 
 
+def _apply_wind_override(wind_speed):
+    global WIND_SPD
+    if wind_speed is not None:
+        WIND_SPD = wind_speed
+
+
 # ==================================================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -548,5 +575,12 @@ if __name__ == "__main__":
         default="udp:127.0.0.1:14550",
         help="MAVLink connection string"
     )
+    parser.add_argument(
+        "--wind-speed",
+        type=float,
+        default=None,
+        help="Override SIM_WIND_SPD (default: use WIND_SPD constant)"
+    )
     args = parser.parse_args()
+    _apply_wind_override(args.wind_speed)
     main(args.connect)
