@@ -13,38 +13,64 @@ No GPS-assisted modes, no autopilot — altitude, heading, and position are cont
 | Cruise altitude | **200 m** |
 | Flight mode | **STABILIZE** (entire flight) |
 | Constant yaw | **~228.5 deg** (bearing A->B) |
-| Wind (SITL) | SPD=3 m/s, DIR=30 deg, TURB=2, TURB_FREQ=0.2 |
+| Wind (SITL) | DIR=30 deg, TURB=2, TURB_FREQ=0.2 |
 
 ---
 
-## Test Results (5 runs)
+## Test Results
 
-| Run | Distance from B | Flight time | Yaw | Status |
-|-----|----------------|-------------|-----|--------|
-| 1 | 0.19 m | 184 s | 228.5 deg | OK |
-| 2 | 0.17 m | 184 s | 228.5 deg | OK |
-| 3 | 0.18 m | 184 s | 228.5 deg | OK |
-| 4 | 0.18 m | 182 s | 228.5 deg | OK |
-| 5 | 0.19 m | 185 s | 228.5 deg | OK |
-| **Average** | **0.18 m** | **184 s** | | **5/5 OK** |
+### Standard test (5 runs, wind 3 m/s)
 
-Best result across all test sessions: **0.01 m** from target point B.
+| Run | Distance from B | Flight time | Status |
+|-----|----------------|-------------|--------|
+| 1 | 0.19 m | 184 s | OK |
+| 2 | 0.17 m | 184 s | OK |
+| 3 | 0.18 m | 184 s | OK |
+| 4 | 0.18 m | 182 s | OK |
+| 5 | 0.19 m | 185 s | OK |
+| **Average** | **0.18 m** | **184 s** | **5/5 OK** |
+
+### Wind robustness test (15 speeds, 1-15 m/s)
+
+Demonstrates the controller is **not overfitted** to a specific wind speed:
+
+| Wind Speed | Distance from B | Flight Time | Status |
+|:----------:|:--------------:|:-----------:|:------:|
+| 1 m/s | 2.06 m | 215 s | OK |
+| 2 m/s | 0.52 m | 194 s | OK |
+| 3 m/s | 0.13 m | 184 s | OK |
+| 4 m/s | **0.11 m** | 183 s | OK |
+| 5 m/s | 0.17 m | 180 s | OK |
+| 6 m/s | 0.19 m | 175 s | OK |
+| 7 m/s | 0.27 m | 175 s | OK |
+| 8 m/s | 0.16 m | 174 s | OK |
+| 9 m/s | 0.25 m | 174 s | OK |
+| 10 m/s | 0.30 m | 173 s | OK |
+| 11 m/s | 0.43 m | 172 s | OK |
+| 12 m/s | 0.60 m | 170 s | OK |
+| 13 m/s | 0.76 m | 168 s | OK |
+| 14 m/s | 1.24 m | 164 s | OK |
+| 15 m/s | 1.17 m | 161 s | OK |
+
+- **15/15 successful landings**, average **0.56 m**, best **0.11 m** (4 m/s)
+- **12/15 sub-meter**, **9/15 under 0.5 m**
+- Consistent accuracy from 2 to 15 m/s wind — no overfitting
 
 ---
 
 ## Project Structure
 
 ```
-Test-Task-Autopilot/
-  flight.py            # Main flight controller (cascaded velocity control)
-  run_tests.py         # Automated 5-flight test runner with SITL/MAVProxy/FlightGear
-  sitl_extra.parm      # SITL parameter overrides (SERIAL1 for MAVProxy)
-  requirements.txt     # Python dependencies (dronekit, pymavlink)
-  results.txt          # Latest test run results
-  Test_fly_video.mov   # Full flight recording (original)
-  Test_fly_video_compressed.mp4  # Compressed flight recording
-  venv/                # Python virtual environment
-  logs/                # ArduPilot telemetry logs
+arducopter-stabilize-nav/
+  flight.py               # Main flight controller (cascaded velocity control)
+  run_tests.py            # Automated 5-flight test runner with SITL/MAVProxy/FlightGear
+  run_wind_tests.py       # Wind robustness test (15 speeds, 1-15 m/s)
+  sitl_extra.parm         # SITL parameter overrides (SERIAL1 for MAVProxy)
+  requirements.txt        # Python dependencies (dronekit, pymavlink)
+  results.txt             # Latest standard test results
+  wind_test_results.txt   # Wind robustness test results
+  venv/                   # Python virtual environment
+  logs/                   # ArduPilot telemetry logs
 ```
 
 ---
@@ -110,7 +136,7 @@ Instead of flying to B at altitude and descending (wind drift during descent), t
 - **18-deg glide slope** from 615m out — continuous descent while maintaining forward progress
 - **35-deg steep slope** inside 20m — preserves altitude for final position correction
 - **Flare at alt < 2m** — slow descent (Vz=-0.8) while velocity controller holds position over B
-- **Wind compensation** — upwind aim offset (15% of drift estimate at >30m, fixed 4.5m at 5-30m)
+- **Adaptive wind compensation** — online wind estimation from velocity PI integrals, dynamic aim offset bounded to prevent runaway
 
 ### Flight Phases
 
